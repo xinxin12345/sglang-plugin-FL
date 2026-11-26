@@ -15,6 +15,12 @@ from sglang_fl.dispatch.backends.flagos.register_ops import register_builtins
 from sglang_fl.dispatch.registry import OpRegistry
 
 
+@pytest.fixture(autouse=True)
+def legacy_flag_gems_only(monkeypatch):
+    # These tests exercise the pre-existing FlagGems/CoreX implementation.
+    monkeypatch.setattr(fla.flaggems_gdn, "get_gdn_op", lambda name: None)
+
+
 def _reference(q, k, v, g, beta, state, cu, scale, normalize=False):
     """Independent token recurrence in SGLang's [V,K] state layout."""
     output = torch.empty_like(v)

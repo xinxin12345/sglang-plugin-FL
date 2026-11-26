@@ -56,6 +56,10 @@ class FlagOSBackend(Backend):
 
     def is_op_available(self, op_name: str) -> bool:
         """Probe the concrete optional kernel, not just the FlagGems package."""
+        from .impl.flaggems_gdn import get_gdn_op
+
+        if get_gdn_op(op_name) is not None:
+            return True
         if not self.is_available():
             return False
         if (

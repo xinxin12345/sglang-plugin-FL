@@ -9,6 +9,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from . import flaggems_gdn
+
 
 def _chunk_kernels():
     from flag_gems.fused.FLA.chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -84,7 +86,25 @@ def chunk_gated_delta_rule_flagos(
     SGLang stores states as [V, K], whereas FlagGems' chunk kernels use [K, V].
     The intermediate states must use SGLang's fixed 64-token chunk size too.
     """
-    cumsum_solve, recompute, recurrent, output_kernel = _chunk_kernels()
+    kernel = flaggems_gdn.get_gdn_op(flaggems_gdn.CHUNK)
+    if (
+        kernel is not None
+        and (cu_seqlens is not None or initial_state_indices is not None)
+        and q.is_cuda
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        # Ragged checkpoint allocation and masked slot selection depend on device values. Use the
+        # capture path saved by SGLang before any live cache is touched.
+        from sglang_fl.dispatch.fla_patch import get_original
+
+        native = get_original(flaggems_gdn.CHUNK)
+        if native is not None:
+            return native(
+                q, k, v, g, beta, scale, initial_state, initial_state_indices,
+                cu_seqlens, head_first, use_qk_l2norm_in_kernel,
+            )
+        raise RuntimeError("captured native chunk operator is unavailable")
+
     if head_first:
         q, k, v, g, beta = (x.transpose(1, 2) for x in (q, k, v, g, beta))
     if cu_seqlens is not None and q.shape[0] != 1:
@@ -111,6 +131,20 @@ def chunk_gated_delta_rule_flagos(
         state = state.masked_fill(~valid[:, None, None, None], 0)
     elif initial_state is not None and initial_state.shape[0] != num_sequences:
         raise ValueError("initial_state must have one state per sequence")
+    if kernel is not None:
+        output, final_state, history = flaggems_gdn.chunk(
+            kernel, (q, k, v, g, beta), state, scale, cu_seqlens,
+            use_qk_l2norm_in_kernel,
+        )
+        if indices is not None:
+            initial_state.index_copy_(
+                0, indices[valid], final_state[valid].to(initial_state.dtype).contiguous()
+            )
+        if head_first:
+            output = output.transpose(1, 2)
+        return output, None, history
+
+    cumsum_solve, recompute, recurrent, output_kernel = _chunk_kernels()
     if state is not None:
         state = state.transpose(-1, -2).contiguous()
 
@@ -279,6 +313,13 @@ def fused_recurrent_gated_delta_rule_packed_decode_flagos(
         raise ValueError("invalid packed decode state indices or output shape")
     if batch == 0:
         return out, initial_state
+
+    kernel = flaggems_gdn.get_gdn_op(flaggems_gdn.PACKED)
+    if kernel is not None:
+        return flaggems_gdn.packed_decode(
+            kernel, mixed_qkv, a, b, A_log, dt_bias, scale, initial_state, out,
+            ssm_state_indices, use_qk_l2norm_in_kernel,
+        )
 
     query, key, value = torch.split(
         mixed_qkv, (query_dim, query_dim, value_heads * value_dim), -1
