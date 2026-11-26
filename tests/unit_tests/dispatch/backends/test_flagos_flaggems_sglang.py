@@ -176,7 +176,7 @@ def _install_fake_flag_gems(monkeypatch, calls):
 
 
 def test_unlisted_vendor_falls_back(fake_package, monkeypatch):
-    fake_package.vendor_name = "kunlunxin"
+    fake_package.vendor_name = "enflame"
     flag_gems_calls = []
     _install_fake_flag_gems(monkeypatch, flag_gems_calls)
 

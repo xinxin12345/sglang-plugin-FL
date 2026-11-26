@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # flaggems_sglang resolves a generic or vendor kernel for every vendor it can
 # detect, so importability alone does not mean the kernel was validated there.
 _COMMON_READY_VENDORS = frozenset(
-    {"nvidia", "iluvatar", "hygon", "mthreads", "ascend", "thead", "metax"}
+    {"nvidia", "iluvatar", "hygon", "kunlunxin", "mthreads", "ascend", "thead", "metax"}
 )
 _READY_VENDORS = {
     "one_pass_rms_norm": _COMMON_READY_VENDORS,
