@@ -26,30 +26,9 @@ from .flaggems_sglang import get_op
 
 def is_gemma_rms_norm_available() -> bool:
     return (
-        get_op("one_pass_rms_norm") is not None
+        get_op("gemma_rmsnorm") is not None
         and get_op("gemma_fused_add_rmsnorm") is not None
     )
-
-
-def _gemma_weight_fp32(obj) -> torch.Tensor:
-    """Return ``1 + weight`` in fp32, cached until the weight is rewritten.
-
-    ``one_pass_rms_norm`` is a standard RMSNorm (``x * rstd * w``), so the Gemma
-    offset is folded into the weight. Keeping it in fp32 matches the reference
-    ``x * (1.0 + weight.float())``; SGLang's own ``gemma_weight`` buffer is
-    stored in the weight dtype and would round ``1 + w`` to bf16.
-    """
-    weight = obj.weight
-    try:
-        key = (weight.data_ptr(), weight._version)
-    except RuntimeError:
-        # Inference tensors carry no version counter; never reuse a stale copy.
-        return weight.detach().float() + 1.0
-    cached = getattr(obj, "_fl_gemma_weight_fp32", None)
-    if cached is None or cached[0] != key:
-        cached = (key, weight.detach().float() + 1.0)
-        obj._fl_gemma_weight_fp32 = cached
-    return cached[1]
 
 
 def gemma_rms_norm_flagos(
@@ -78,7 +57,7 @@ def gemma_rms_norm_flagos(
     eps = obj.variance_epsilon
 
     if residual is None:
-        out = get_op("one_pass_rms_norm")(x2d, _gemma_weight_fp32(obj), eps)
+        out = get_op("gemma_rmsnorm")(x2d, obj.weight, eps)
         return out.view(shape)
 
     out, residual_out = get_op("gemma_fused_add_rmsnorm")(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 import torch
@@ -19,10 +19,10 @@ from sglang_fl.dispatch.registry import OpRegistry
 
 
 # Kernels mirroring flaggems_sglang/reference/*.py.
-def _one_pass_rms_norm(x, w, eps):
+def _gemma_rmsnorm(x, weight, eps):
     xf = x.float()
     rstd = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    return (xf * rstd * w.float()).to(x.dtype)
+    return (xf * rstd * (1.0 + weight.float())).to(x.dtype)
 
 
 def _gemma_fused_add_rmsnorm(x, residual, weight, eps):
@@ -50,7 +50,7 @@ def fake_package(monkeypatch):
         return wrapper
 
     kernels = {
-        "one_pass_rms_norm": recorded("one_pass_rms_norm", _one_pass_rms_norm),
+        "gemma_rmsnorm": recorded("gemma_rmsnorm", _gemma_rmsnorm),
         "gemma_fused_add_rmsnorm": recorded(
             "gemma_fused_add_rmsnorm", _gemma_fused_add_rmsnorm
         ),
@@ -86,8 +86,8 @@ def test_gemma_without_residual_matches_reference(fake_package, shape):
     assert actual.shape == x.shape
     torch.testing.assert_close(actual, gemma_rms_norm_torch(obj, x))
     (name, (_, weight, eps)), = fake_package.calls
-    assert name == "one_pass_rms_norm"
-    assert weight.dtype == torch.float32
+    assert name == "gemma_rmsnorm"
+    assert weight is obj.weight
     assert eps == obj.variance_epsilon
 
 
@@ -138,21 +138,17 @@ def test_gemma_empty_input_skips_kernels(fake_package):
     assert fake_package.calls == []
 
 
-def test_gemma_weight_offset_follows_in_place_weight_updates(fake_package):
+def test_gemma_follows_in_place_weight_updates(fake_package):
     obj = _norm(64)
     x = torch.randn(3, 64).to(torch.bfloat16)
-    first = gemma._gemma_weight_fp32(obj)
-    assert gemma._gemma_weight_fp32(obj) is first
+    before = gemma.gemma_rms_norm_flagos(obj, x)
 
     with torch.no_grad():
-        obj.weight.copy_(torch.randn(64).to(torch.bfloat16))
+        obj.weight.add_(1.0)
 
-    second = gemma._gemma_weight_fp32(obj)
-    assert second is not first
-    torch.testing.assert_close(second, obj.weight.float() + 1.0)
-    torch.testing.assert_close(
-        gemma.gemma_rms_norm_flagos(obj, x), gemma_rms_norm_torch(obj, x)
-    )
+    after = gemma.gemma_rms_norm_flagos(obj, x)
+    assert not torch.equal(before, after)
+    torch.testing.assert_close(after, gemma_rms_norm_torch(obj, x))
 
 
 def test_silu_and_mul_uses_flaggems_sglang(fake_package):
@@ -187,8 +183,10 @@ def test_unlisted_vendor_falls_back(fake_package, monkeypatch):
     assert fake_package.calls == []
 
 
-def test_missing_kernel_disables_gemma(fake_package):
-    fake_package.get_op = {"one_pass_rms_norm": _one_pass_rms_norm}.get
+@pytest.mark.parametrize("missing_op", ["gemma_rmsnorm", "gemma_fused_add_rmsnorm"])
+def test_missing_kernel_disables_gemma(fake_package, missing_op):
+    lookup = fake_package.get_op
+    fake_package.get_op = lambda name: None if name == missing_op else lookup(name)
 
     assert not gemma.is_gemma_rms_norm_available()
 

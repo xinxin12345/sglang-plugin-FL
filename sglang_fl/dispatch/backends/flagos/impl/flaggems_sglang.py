@@ -29,7 +29,7 @@ _COMMON_READY_VENDORS = frozenset(
     {"nvidia", "iluvatar", "hygon", "kunlunxin", "mthreads", "ascend", "thead", "metax"}
 )
 _READY_VENDORS = {
-    "one_pass_rms_norm": _COMMON_READY_VENDORS,
+    "gemma_rmsnorm": _COMMON_READY_VENDORS,
     "gemma_fused_add_rmsnorm": _COMMON_READY_VENDORS,
     "silu_and_mul": _COMMON_READY_VENDORS,
 }
