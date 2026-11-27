@@ -56,6 +56,11 @@ class FlagOSBackend(Backend):
 
     def is_op_available(self, op_name: str) -> bool:
         """Probe the concrete optional kernel, not just the FlagGems package."""
+        if op_name == "chunk_gated_delta_rule":
+            # FlagGems-sglang can provide chunk independently of flag_gems.
+            from .impl.fla import is_fla_op_available
+
+            return is_fla_op_available(op_name)
         if not self.is_available():
             return False
         if (
@@ -71,7 +76,6 @@ class FlagOSBackend(Backend):
         # MUSA and other vendors on their current implementations until their
         # FlagGems fused-kernel contracts have been validated independently.
         if op_name in (
-            "chunk_gated_delta_rule",
             "fused_recurrent_gated_delta_rule_packed_decode",
             "fused_moe",
         ):

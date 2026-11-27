@@ -8,8 +8,9 @@ from types import ModuleType
 import pytest
 import torch
 
+from sglang_fl import utils
 from sglang_fl.dispatch.backends.flagos.flagos import FlagOSBackend
-from sglang_fl.dispatch.backends.flagos.impl import activation, flaggems_sglang
+from sglang_fl.dispatch.backends.flagos.impl import activation, fla, flaggems_sglang
 from sglang_fl.dispatch.backends.flagos.impl import gemma_rms_norm as gemma
 from sglang_fl.dispatch.backends.flagos.register_ops import register_builtins
 from sglang_fl.dispatch.backends.reference.impl.gemma_rms_norm import (
@@ -61,6 +62,7 @@ def fake_package(monkeypatch):
     package.get_op = kernels.get
     package.calls = calls
     monkeypatch.setitem(sys.modules, "flaggems_sglang", package)
+    monkeypatch.setattr(utils, "get_device_info", lambda: package)
     flaggems_sglang._package.cache_clear()
     flaggems_sglang.get_op.cache_clear()
     yield package
@@ -224,3 +226,122 @@ def test_flagos_registers_gemma_rms_norm(fake_package, monkeypatch, vendor_name,
         obj = _norm(32)
         x = torch.randn(2, 32).to(torch.bfloat16)
         torch.testing.assert_close(impl.fn(obj, x), gemma_rms_norm_torch(obj, x))
+
+
+@pytest.mark.parametrize("head_first", [False, True])
+def test_chunk_ragged_history_cache_and_grouped_heads(fake_package, monkeypatch, head_first):
+    calls = []
+
+    def kernel(q, k, v, initial_state, output_final_state, **kwargs):
+        assert q.shape[2] == v.shape[2] == 2
+        assert initial_state.shape == (1, 2, 4, 3)
+        assert initial_state.is_contiguous() and initial_state.dtype == torch.float32
+        assert output_final_state and kwargs["use_qk_l2norm_in_kernel"]
+        calls.append(q.shape[1])
+        return v, initial_state + q.shape[1]
+
+    def get_op(name):
+        assert name == "chunk_gated_delta_rule_fwd"
+        return kernel
+
+    monkeypatch.setattr(fake_package, "get_op", get_op)
+    monkeypatch.setattr(FlagOSBackend, "is_available", lambda self: False)
+    monkeypatch.setattr(utils, "get_device_info", lambda: None)
+    registry = OpRegistry()
+    register_builtins(registry)
+    (impl,) = registry.snapshot().impls_by_op["chunk_gated_delta_rule"]
+    assert impl.impl_id == "default.flagos"
+    assert FlagOSBackend().is_op_available("chunk_gated_delta_rule")
+    assert impl.is_available()
+
+    length = 68
+    q = torch.ones(1, length, 1, 4, dtype=torch.bfloat16)
+    v = torch.randn(1, length, 2, 3, dtype=torch.bfloat16)
+    gates = torch.ones(1, length, 2)
+    args = (q, q, v, gates, gates)
+    if head_first:
+        args = tuple(x.transpose(1, 2) for x in args)
+    pool = torch.arange(4 * 2 * 3 * 4).reshape(4, 2, 3, 4).float()
+    before = pool.clone()
+    out, final, h = impl.fn(
+        *args,
+        0.5,
+        pool,
+        torch.tensor([0, -1, 1, 2]),
+        torch.tensor([0, 65, 66, 66, 68]),
+        head_first,
+        True,
+    )
+    assert calls == [64, 1, 1, 2]
+    assert final is None
+    torch.testing.assert_close(out, args[2])
+    expected_h = torch.stack(
+        (before[0], before[0] + 64, torch.zeros_like(before[0]), before[2])
+    )
+    torch.testing.assert_close(h, expected_h.unsqueeze(0).to(q.dtype))
+    before[0] += 65
+    before[2] += 2
+    torch.testing.assert_close(pool, before)
+
+
+@pytest.mark.parametrize("sglang_kernel", [None, object()])
+def test_listed_vendor_requires_callable_chunk_export(fake_package, monkeypatch, sglang_kernel):
+    monkeypatch.setattr(fake_package, "get_op", lambda name: sglang_kernel)
+    with pytest.raises(ImportError, match="chunk_gated_delta_rule_fwd"):
+        flaggems_sglang.get_op("chunk_gated_delta_rule_fwd")
+    monkeypatch.setattr(fla, "_chunk_kernels", lambda: pytest.fail("unexpected legacy lookup"))
+    registry = OpRegistry()
+    register_builtins(registry)
+    (impl,) = registry.snapshot().impls_by_op["chunk_gated_delta_rule"]
+    assert not impl.is_available()
+    x = torch.zeros(1, 1, 1, 1)
+    with pytest.raises(ImportError, match="chunk_gated_delta_rule_fwd"):
+        impl.fn(x, x, x, x[..., 0], x[..., 0], 1.0)
+
+
+@pytest.mark.parametrize("vendor_name", ["kunlunxin", "hygon"])
+def test_unlisted_vendor_checks_legacy_chunk_kernels(fake_package, monkeypatch, vendor_name):
+    fake_package.vendor_name = vendor_name
+    monkeypatch.setattr(fake_package, "get_op", lambda name: pytest.fail("unexpected fused lookup"))
+    assert flaggems_sglang.get_op("chunk_gated_delta_rule_fwd") is None
+    monkeypatch.delattr(torch, "corex", raising=False)
+    monkeypatch.setattr(fla, "_chunk_kernels", lambda: (lambda: None,) * 4)
+    registry = OpRegistry()
+    register_builtins(registry)
+    (impl,) = registry.snapshot().impls_by_op["chunk_gated_delta_rule"]
+    backend = FlagOSBackend()
+    assert backend.is_op_available("chunk_gated_delta_rule")
+    assert impl.is_available()
+    assert fla.is_fla_op_available("chunk_gated_delta_rule")
+
+    monkeypatch.setattr(fla, "_chunk_kernels", lambda: (None,) * 4)
+    assert not backend.is_op_available("chunk_gated_delta_rule")
+    assert not fla.is_fla_op_available("chunk_gated_delta_rule")
+    assert not impl.is_available()
+
+
+@pytest.mark.parametrize("vendor_name,expected", [("iluvatar", False), ("kunlunxin", True)])
+def test_chunk_without_sglang_package(fake_package, monkeypatch, vendor_name, expected):
+    fake_package.vendor_name = vendor_name
+    monkeypatch.setitem(sys.modules, "flaggems_sglang", None)
+    monkeypatch.setattr(fla, "_chunk_kernels", lambda: (lambda: None,) * 4)
+    assert FlagOSBackend().is_op_available("chunk_gated_delta_rule") is expected
+
+
+@pytest.mark.parametrize("vendor_name", ["nvidia", "iluvatar", "thead", "mthreads", "metax"])
+def test_chunk_dense_keeps_history_per_request(fake_package, monkeypatch, vendor_name):
+    fake_package.vendor_name = vendor_name
+
+    def kernel(*, v, initial_state, **kwargs):
+        return v, initial_state + v.sum(dim=1).unsqueeze(-2)
+
+    monkeypatch.setattr(fake_package, "get_op", lambda name: kernel)
+    q = torch.ones(2, 65, 1, 4, dtype=torch.bfloat16)
+    v = torch.ones(2, 65, 1, 3, dtype=q.dtype)
+    v[1].fill_(2)
+    gate = torch.ones(2, 65, 1)
+    out, final, h = fla.chunk_gated_delta_rule_flagos(q, q, v, gate, gate, 0.5)
+    torch.testing.assert_close(out, v)
+    assert final is None and h.shape == (2, 2, 1, 3, 4)
+    assert h[:, 0].eq(0).all()
+    assert h[0, 1].eq(64).all() and h[1, 1].eq(128).all()

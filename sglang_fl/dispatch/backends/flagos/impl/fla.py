@@ -9,6 +9,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from .flaggems_sglang import get_op
+
 
 def _chunk_kernels():
     from flag_gems.fused.FLA.chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -42,10 +44,12 @@ def _packed_decode_kernel():
 
 
 def is_fla_op_available(op_name: str) -> bool:
-    """An installed FlagGems version may omit individual fused kernels."""
+    """Check for a supported implementation of the requested FLA operator."""
     try:
         if op_name == "chunk_gated_delta_rule":
-            return all(callable(kernel) for kernel in _chunk_kernels())
+            return get_op("chunk_gated_delta_rule_fwd") is not None or all(
+                callable(kernel) for kernel in _chunk_kernels()
+            )
         if op_name == "fused_recurrent_gated_delta_rule_packed_decode":
             triton, kernel = _packed_decode_kernel()
             return hasattr(kernel, "__getitem__") and callable(triton.next_power_of_2)
@@ -84,7 +88,21 @@ def chunk_gated_delta_rule_flagos(
     SGLang stores states as [V, K], whereas FlagGems' chunk kernels use [K, V].
     The intermediate states must use SGLang's fixed 64-token chunk size too.
     """
-    cumsum_solve, recompute, recurrent, output_kernel = _chunk_kernels()
+    kernel = get_op("chunk_gated_delta_rule_fwd")
+    if kernel is not None and (cu_seqlens is not None or initial_state_indices is not None):
+        device = getattr(torch, q.device.type, None)
+        capturing = getattr(device, "is_current_stream_capturing", None)
+        if callable(capturing) and capturing():
+            # Ragged history sizes and masked slot writes depend on device data.
+            from sglang_fl.dispatch.fla_patch import get_original
+
+            native = get_original("chunk_gated_delta_rule")
+            if native is None:
+                raise RuntimeError("Original SGLang chunk function unavailable during capture")
+            return native(
+                q, k, v, g, beta, scale, initial_state, initial_state_indices,
+                cu_seqlens, head_first, use_qk_l2norm_in_kernel,
+            )
     if head_first:
         q, k, v, g, beta = (x.transpose(1, 2) for x in (q, k, v, g, beta))
     if cu_seqlens is not None and q.shape[0] != 1:
@@ -111,6 +129,62 @@ def chunk_gated_delta_rule_flagos(
         state = state.masked_fill(~valid[:, None, None, None], 0)
     elif initial_state is not None and initial_state.shape[0] != num_sequences:
         raise ValueError("initial_state must have one state per sequence")
+    if kernel is not None:
+        batch, tokens, value_heads, value_dim = v.shape
+        query_heads, key_dim = q.shape[2:]
+        if k.shape[2] != query_heads or query_heads <= 0 or value_heads % query_heads:
+            raise ValueError("Q/K heads must match and divide the number of value heads")
+        if value_heads != query_heads:
+            q = q.repeat_interleave(value_heads // query_heads, dim=2)
+            k = k.repeat_interleave(value_heads // query_heads, dim=2)
+
+        bounds = [0, tokens] if cu_seqlens is None else cu_seqlens.tolist()
+        if not bounds or bounds[0] != 0 or bounds[-1] != tokens:
+            raise ValueError("cu_seqlens must span all packed tokens")
+        lengths = [end - start for start, end in zip(bounds, bounds[1:])]
+        if any(length < 0 for length in lengths):
+            raise ValueError("cu_seqlens must be nondecreasing")
+        block_size = 64
+        num_blocks = sum((length + block_size - 1) // block_size for length in lengths)
+        history = k.new_empty((batch, num_blocks, value_heads, value_dim, key_dim))
+        output = torch.empty_like(v)
+        if state is None:
+            state = v.new_zeros((num_sequences, value_heads, key_dim, value_dim), dtype=torch.float32)
+        else:
+            state = state.transpose(-1, -2).float().contiguous()
+        final_state = torch.empty_like(state) if indices is not None else None
+
+        # Dense requests share the token axis. Packed requests have independent boundaries.
+        block_index = 0
+        for seq, (start, end) in enumerate(zip(bounds, bounds[1:])):
+            rows = slice(None) if cu_seqlens is None else slice(seq, seq + 1)
+            block_state = state[rows]
+            for pos in range(start, end, block_size):
+                span = slice(pos, min(pos + block_size, end))
+                history[:, block_index].copy_(block_state.transpose(-1, -2))
+                block_output, block_state = kernel(
+                    q=q[:, span].contiguous(),
+                    k=k[:, span].contiguous(),
+                    v=v[:, span].contiguous(),
+                    g=g[:, span].contiguous(),
+                    beta=beta[:, span].contiguous(),
+                    scale=scale,
+                    initial_state=block_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                )
+                output[:, span].copy_(block_output)
+                block_index += 1
+            if final_state is not None:
+                final_state[rows].copy_(block_state)
+        if indices is not None:
+            updated = final_state[valid].transpose(-1, -2).to(initial_state.dtype).contiguous()
+            initial_state.index_copy_(0, indices[valid], updated)
+        if head_first:
+            output = output.transpose(1, 2)
+        return output, None, history
+
+    cumsum_solve, recompute, recurrent, output_kernel = _chunk_kernels()
     if state is not None:
         state = state.transpose(-1, -2).contiguous()
 

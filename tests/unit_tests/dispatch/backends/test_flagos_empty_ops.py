@@ -10,7 +10,7 @@ import torch
 
 from sglang_fl import utils
 from sglang_fl.dispatch.backends.flagos.flagos import FlagOSBackend
-from sglang_fl.dispatch.backends.flagos.impl import fla, fused_moe
+from sglang_fl.dispatch.backends.flagos.impl import fla, flaggems_sglang, fused_moe
 from sglang_fl.dispatch.backends.flagos.register_ops import register_builtins
 from sglang_fl.dispatch.registry import OpRegistry
 
@@ -182,6 +182,7 @@ def test_recurrent_variable_length_and_zero_initial_state(monkeypatch):
 
 
 def _mock_chunk_pipeline(monkeypatch):
+    monkeypatch.setattr(fla, "get_op", lambda name: None)
     captured = {}
 
     def cumsum(**kwargs):
@@ -394,6 +395,10 @@ def test_moe_rejects_quantized_weights_before_importing_kernel(dtype):
 
 
 def test_optional_kernel_capabilities_are_probed_per_operator(monkeypatch):
+    kernels = {}
+    package = SimpleNamespace(vendor_name="iluvatar", get_op=kernels.get)
+    monkeypatch.setattr(flaggems_sglang, "_package", lambda: package)
+    monkeypatch.setattr(fla, "get_op", flaggems_sglang.get_op.__wrapped__)
     monkeypatch.setattr(
         utils, "get_device_info", lambda: SimpleNamespace(vendor_name="iluvatar")
     )
@@ -420,6 +425,7 @@ def test_optional_kernel_capabilities_are_probed_per_operator(monkeypatch):
     ):
         assert not impls[name][0].is_available()
     monkeypatch.setattr(fla, "_chunk_kernels", lambda: (lambda: None,) * 4)
+    kernels["chunk_gated_delta_rule_fwd"] = lambda: None
     monkeypatch.setattr(
         fla, "_recurrent_kernel", lambda: lambda inplace_final_state=True: None
     )
@@ -442,7 +448,13 @@ def test_new_flagos_defaults_do_not_replace_other_vendors(
     monkeypatch.setattr(FlagOSBackend, "_available", True)
     monkeypatch.delattr(torch, "corex", raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(fla, "is_fla_op_available", lambda name: True)
+    monkeypatch.setattr(flaggems_sglang, "_package", lambda: None)
+    monkeypatch.setattr(fla, "get_op", flaggems_sglang.get_op.__wrapped__)
+    monkeypatch.setattr(fla, "_chunk_kernels", lambda: (lambda: None,) * 4)
+    monkeypatch.setattr(
+        fla, "_recurrent_kernel", lambda: lambda inplace_final_state=True: None
+    )
+    monkeypatch.setattr(fla, "_packed_decode_kernel", lambda: _fake_packed_runtime([]))
     monkeypatch.setattr(fused_moe, "is_fused_moe_available", lambda: True)
     backend = FlagOSBackend()
     registry = OpRegistry()
@@ -453,8 +465,9 @@ def test_new_flagos_defaults_do_not_replace_other_vendors(
         "fused_recurrent_gated_delta_rule_packed_decode",
         "fused_moe",
     ):
-        assert not backend.is_op_available(name)
-        assert not impls[name][0].is_available()
+        available = name == "chunk_gated_delta_rule" and vendor_name == "ascend"
+        assert backend.is_op_available(name) is available
+        assert impls[name][0].is_available() is available
     assert (
         backend.is_op_available("fused_recurrent_gated_delta_rule")
         is recurrent_available

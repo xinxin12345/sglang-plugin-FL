@@ -32,6 +32,7 @@ _READY_VENDORS = {
     "gemma_rmsnorm": _COMMON_READY_VENDORS,
     "gemma_fused_add_rmsnorm": _COMMON_READY_VENDORS,
     "silu_and_mul": _COMMON_READY_VENDORS,
+    "chunk_gated_delta_rule_fwd": frozenset({"nvidia", "iluvatar", "thead", "mthreads", "metax"}),
 }
 
 
@@ -51,8 +52,22 @@ def _package():
 
 @functools.lru_cache(maxsize=None)
 def get_op(name: str) -> Optional[Callable]:
-    """Return the resolved flaggems_sglang kernel, or None if not ready here."""
+    """Resolve a kernel. Listed chunk vendors require a callable export."""
+    vendors = _READY_VENDORS.get(name, ())
+    require_kernel = name == "chunk_gated_delta_rule_fwd"
+    if require_kernel:
+        from sglang_fl.utils import get_device_info
+
+        device = get_device_info() or _package()
+        if device is None:
+            raise ImportError(f"Cannot determine the device vendor for {name}")
+        if device.vendor_name not in vendors:
+            return None
+
     package = _package()
-    if package is None or package.vendor_name not in _READY_VENDORS.get(name, ()):
-        return None
-    return package.get_op(name)
+    kernel = None
+    if package is not None and package.vendor_name in vendors:
+        kernel = package.get_op(name)
+    if require_kernel and not callable(kernel):
+        raise ImportError(f"FlagGems-sglang kernel {name} is unavailable for this device")
+    return kernel
